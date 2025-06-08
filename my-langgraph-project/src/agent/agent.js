@@ -1,6 +1,6 @@
-const { StatefulGraph } = require("@langchain/langgraph");
+const { StateGraph } = require("@langchain/langgraph");
 const { HumanMessage, AIMessage, ToolMessage } = require("@langchain/core/messages");
-const { ChatOllama } = require("@langchain/community/chat_models/ollama");
+const { ChatOllama} = require("@langchain/ollama");
 const { OLLAMA_BASE_URL, OLLAMA_MODEL } = require("../config/config.js");
 const { currentWeatherTool } = require("../tools/example_tool.js");
 const { fetchUserProfileTool } = require("../tools/externalProtocolTool.js");
@@ -25,7 +25,6 @@ const log = (level, ...args) => {
 
 // Instantiate the Ollama LLM
 const llm = new ChatOllama({
-  baseUrl: OLLAMA_BASE_URL,
   model: OLLAMA_MODEL,
   // temperature: 0,
 });
@@ -109,7 +108,7 @@ async function generateResponseNode(state) {
   return {};
 }
 
-const workflow = new StatefulGraph({ channels: agentState });
+const workflow = new StateGraph({ channels: agentState });
 workflow.addNode("getUserInput", getUserInputNode);
 workflow.addNode("callModel", callModelNode);
 workflow.addNode("action", actionNode);
