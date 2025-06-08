@@ -1,7 +1,8 @@
 const { StateGraph } = require("@langchain/langgraph");
-const { HumanMessage, AIMessage, ToolMessage } = require("@langchain/core/messages");
+const { HumanMessage, AIMessage, ToolMessage, SystemMessage } = require("@langchain/core/messages"); // Added SystemMessage
 const { ChatOllama} = require("@langchain/ollama");
-const { OLLAMA_BASE_URL, OLLAMA_MODEL } = require("../config/config.js");
+const { MultiServerMCPClient } = require("@langchain/mcp-adapters");
+const { MCP_SERVERS, OLLAMA_BASE_URL, OLLAMA_MODEL } = require("../config/config.js");
 const { currentWeatherTool } = require("../tools/example_tool.js");
 const { fetchUserProfileTool } = require("../tools/externalProtocolTool.js");
 
@@ -23,42 +24,127 @@ const log = (level, ...args) => {
   console[level](`${AGENT_LOG_PREFIX}[${new Date().toISOString()}]`, ...args);
 };
 
-// Instantiate the Ollama LLM
+log("info", "Initial available tools:", Object.keys(availableTools).join(", "));
+
+// IIFE to load MCP tools
+(async () => {
+  log("info", "Attempting to load MCP tools...");
+  if (MCP_SERVERS && Object.keys(MCP_SERVERS).length > 0) {
+    log("info", "MCP_SERVERS configuration found:", JSON.stringify(MCP_SERVERS));
+    try {
+      const client = new MultiServerMCPClient({
+        mcpServers: MCP_SERVERS,
+      });
+
+      log("info", "MultiServerMCPClient initialized. Fetching tools...");
+      const mcpTools = await client.getTools();
+      log("info", `Fetched ${mcpTools.length} MCP tools.`);
+
+      if (mcpTools.length > 0) {
+        mcpTools.forEach(tool => {
+          if (availableTools[tool.name]) {
+            log("warn", `MCP Tool "${tool.name}" (from server) conflicts with an existing tool. The existing tool will be overwritten by the MCP tool.`);
+          }
+          availableTools[tool.name] = tool;
+          log("info", `MCP Tool "${tool.name}" added to availableTools dynamically.`);
+        });
+
+        if (llm && typeof modelWithTools !== 'undefined') {
+          log("info", "Re-binding tools to LLM after MCP tools have been loaded.");
+          modelWithTools = llm.bindTools(Object.values(availableTools));
+          log("info", "LLM tools re-bound. Current tools:", Object.keys(availableTools).join(", "));
+        } else {
+          log("info", "LLM or modelWithTools not yet initialized. MCP tools will be included in initial binding.");
+        }
+      } else {
+        log("info", "No MCP tools were loaded from the configured servers.");
+      }
+    } catch (error) {
+      log("error", "Failed to initialize MCP client or load MCP tools:", error.message);
+      if (error.stack) {
+        log("debug", "MCP tool loading error stack:", error.stack);
+      }
+    }
+  } else {
+    log("info", "No MCP_SERVERS configured or configuration is empty. Skipping MCP tool loading.");
+  }
+})();
+
 const llm = new ChatOllama({
   model: OLLAMA_MODEL,
-  // temperature: 0,
 });
 log("info", `ChatOllama model initialized with baseUrl: ${OLLAMA_BASE_URL}, model: ${OLLAMA_MODEL}`);
 
-// Bind tools to the LLM
-const modelWithTools = llm.bindTools(Object.values(availableTools));
-log("info", "LLM tools bound:", Object.keys(availableTools).join(", "));
+let modelWithTools = llm.bindTools(Object.values(availableTools));
+log("info", "LLM tools bound (initial binding):", Object.keys(availableTools).join(", "));
 
 
 async function getUserInputNode(state) {
   log("info", "Node:getUserInputNode - Current state messages:", JSON.stringify(state.messages, null, 2));
-  // Assuming input messages are already in the state when the graph is invoked.
-  return { messages: [] }; // No new messages to add, just pass existing state.
+  return { messages: [] };
 }
 
 async function callModelNode(state) {
   const { messages } = state;
-  log("info", `Node:callModelNode - Invoking LLM with ${messages.length} messages.`);
-  log("debug", "Node:callModelNode - Current messages stack for LLM:", JSON.stringify(messages, null, 2));
+
+  // Construct the dynamic SystemMessage
+  const toolNames = Object.keys(availableTools);
+  // More specific instructions for Ollama tool usage, emphasizing JSON output.
+  const systemMessageContent = `You are a helpful assistant. You have access to the following tools: ${toolNames.join(', ')}.
+When you decide to use a tool, you MUST respond ONLY with a valid JSON object representing the tool call(s).
+This JSON object must have a single key "tool_calls", which is an array of objects. Each object in the array must contain:
+1. "name": The name of the tool to be called (string).
+2. "args": An object containing the arguments for the tool (object).
+3. "id": A unique identifier for this specific tool call (string, e.g., "call_abc123").
+
+Example of a valid JSON response for a single tool call:
+{
+  "tool_calls": [
+    {
+      "name": "tool_name_here",
+      "args": { "parameter1": "value1", "parameter2": "value2" },
+      "id": "call_xyz789"
+    }
+  ]
+}
+
+Example of a valid JSON response for multiple tool calls (if supported and appropriate):
+{
+  "tool_calls": [
+    {
+      "name": "tool_one",
+      "args": { "argA": "valA" },
+      "id": "call_multi_001"
+    },
+    {
+      "name": "tool_two",
+      "args": { "argB": "valB" },
+      "id": "call_multi_002"
+    }
+  ]
+}
+
+If you do not need to use a tool to answer the user's request or if the query is a general conversational statement, respond directly to the user with a natural language message. Do NOT use the JSON tool call format in this case.
+Do not include any explanatory text, markdown formatting, or any other content outside of the JSON object if you are calling a tool. Your response must be ONLY the JSON object.`;
+
+  const systemMessage = new SystemMessage({ content: systemMessageContent }); // Ensure content is passed correctly
+
+  log("info", `Node:callModelNode - Constructed SystemMessage. Available tools: ${toolNames.join(', ')}`);
+  // log("debug", "Node:callModelNode - SystemMessage content:", systemMessageContent); // Content can be long
+
+  const messagesForLLM = [systemMessage, ...messages];
+  log("info", `Node:callModelNode - Invoking LLM with ${messagesForLLM.length} messages (SystemMessage + current stack).`);
+  log("debug", "Node:callModelNode - Messages for LLM (with SystemMessage prepended):", JSON.stringify(messagesForLLM.map(m => ({type: m._getType(), content: m.content, tool_calls: m.tool_calls || undefined })), null, 2));
 
   try {
-    // Invoke the LLM with the current message history and bound tools
-    const aiResponse = await modelWithTools.invoke(messages);
+    const aiResponse = await modelWithTools.invoke(messagesForLLM);
     log("info", "Node:callModelNode - LLM invocation successful.");
     log("debug", "Node:callModelNode - Raw AIMessage from LLM:", JSON.stringify(aiResponse, null, 2));
-
-    // The aiResponse should be an AIMessage, possibly with tool_calls
     return { messages: [aiResponse] };
-
   } catch (error) {
     log("error", "Node:callModelNode - Error invoking LLM:", error);
-    // Return an AIMessage indicating an error occurred
-    return { messages: [new AIMessage({ content: `Error calling LLM: ${error.message}` })] };
+    // It's good practice to include the error message in the AIMessage if possible, or a generic error.
+    return { messages: [new AIMessage({ content: `Sorry, I encountered an error trying to process your request. Error: ${error.message}` })] };
   }
 }
 
@@ -72,15 +158,13 @@ async function actionNode(state) {
     return { messages: [] };
   }
 
-  // Langchain typically puts tool calls in `lastMessage.tool_calls` (an array)
-  // For now, process the first tool call if multiple are present.
-  const toolCall = lastMessage.tool_calls[0];
+  const toolCall = lastMessage.tool_calls[0]; // Processing the first tool call for simplicity
   log("info", `Node:actionNode - Processing tool_call ID: ${toolCall.id}, Name: ${toolCall.name}, Args: ${JSON.stringify(toolCall.args)}`);
 
   const toolToCall = availableTools[toolCall.name];
 
   if (!toolToCall) {
-    const errorMsg = `Error: Unknown tool '${toolCall.name}' was called by the LLM.`;
+    const errorMsg = `Error: Unknown tool '${toolCall.name}' was called by the LLM. Available tools: ${Object.keys(availableTools).join(", ")}`;
     log("error", `Node:actionNode - ${errorMsg}`);
     return { messages: [new ToolMessage({ content: errorMsg, tool_call_id: toolCall.id, name: toolCall.name })] };
   }
@@ -88,6 +172,9 @@ async function actionNode(state) {
   log("info", `Node:actionNode - Executing tool '${toolCall.name}' with args: ${JSON.stringify(toolCall.args)}`);
   let toolOutputContent;
   try {
+    if (typeof toolToCall.invoke !== 'function') {
+        throw new Error(`Tool "${toolCall.name}" is not a valid LangChain tool (missing invoke method).`);
+    }
     toolOutputContent = await toolToCall.invoke(toolCall.args);
     log("info", `Node:actionNode - Tool '${toolCall.name}' execution successful. Output (substring): "${String(toolOutputContent).substring(0,200)}..."`);
   } catch (error) {
@@ -102,9 +189,6 @@ async function actionNode(state) {
 
 async function generateResponseNode(state) {
   log("info", "Node:generateResponseNode - Final state processing:", JSON.stringify(state.messages, null, 2));
-  // The final user-facing response is the content of the last AIMessage
-  // that does not have tool_calls.
-  // This node itself doesn't modify messages, just signifies the end.
   return {};
 }
 

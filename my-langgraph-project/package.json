@@ -15,6 +15,7 @@
     "@langchain/core": "^0.3.57",
     "@langchain/langgraph": "^0.3.1",
     "@langchain/ollama": "^0.2.1",
+    "@langchain/mcp-adapters": "^0.5.2",
     "axios": "^1.9.0",
     "body-parser": "^2.2.0",
     "express": "^5.1.0",
